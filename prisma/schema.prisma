@@ -1,0 +1,126 @@
+// Mathematics Simulator — authentication & authorization data layer.
+//
+// Security model:
+// - Passwords are hashed with Argon2id (OWASP params: m=19 MiB, t=2, p=1).
+// - Every password gets a UNIQUE 128-bit random salt (generated per hash,
+//   stored alongside the PHC string for rotation/audit purposes).
+// - Sessions are opaque 256-bit tokens; only their SHA-256 hash is stored,
+//   the raw token never touches the database.
+// - Session cookies are HttpOnly + SameSite=Lax + Secure (when HTTPS).
+// - Every login attempt is audited (LoginAttempt) and rate limited in RAM.
+//
+// NOTE: SQLite does not support Prisma enums, so Role/reason are Strings
+// validated at the application boundary (see src/lib/auth/*).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id          String   @id @default(cuid())
+  email       String   @unique
+  name        String?
+  role        String   @default("USER") // "USER" | "ADMIN" (validated in app code)
+  isActive    Boolean  @default(true)
+  lastLoginAt DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  password      PasswordCredential?
+  emails        EmailAddress[]
+  sessions      Session[]
+  loginAttempts LoginAttempt[]
+  permissions   Permission[]
+
+  @@index([role])
+}
+
+// Every email address known for a user. The canonical login email lives on
+// User.email and is always mirrored here as the primary address.
+model EmailAddress {
+  id         String   @id @default(cuid())
+  userId     String
+  address    String   @unique
+  isPrimary  Boolean  @default(false)
+  isVerified Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// One credential per user. `hash` is the full PHC string
+// ($argon2id$v=19$m=19456,t=2,p=1$<salt-b64>$<hash-b64>) — self-describing,
+// so parameters travel with the hash. `salt` is stored separately (hex) to
+// guarantee/enforce per-password uniqueness at the database level.
+model PasswordCredential {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  hash          String
+  salt          String   @unique
+  algorithm     String   @default("argon2id")
+  params        String   @default("{\"memoryCost\":19456,\"timeCost\":2,\"parallelism\":1}")
+  version       Int      @default(1)
+  lastChangedAt DateTime @default(now())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// Opaque server-side sessions. The cookie carries a 256-bit random token;
+// only sha256(token) is persisted, so a DB leak cannot be replayed as a login.
+model Session {
+  id         String   @id @default(cuid())
+  userId     String
+  tokenHash  String   @unique
+  expiresAt  DateTime
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// Audit trail for every login attempt (successful or not). Never stores
+// passwords. Powers the admin "Seguridad" tab and brute-force forensics.
+model LoginAttempt {
+  id        String   @id @default(cuid())
+  email     String
+  userId    String?
+  ip        String?
+  userAgent String?
+  success   Boolean
+  reason    String? // ok | unknown_email | bad_password | inactive | rate_limited | locked
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([email])
+  @@index([createdAt])
+  @@index([success, createdAt])
+}
+
+// Granular permissions for non-admin users (ADMIN implicitly has all keys).
+model Permission {
+  id        String   @id @default(cuid())
+  userId    String
+  key       String // users:read | users:write | sessions:revoke | audit:read
+  grantedBy String?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, key])
+  @@index([userId])
+}
